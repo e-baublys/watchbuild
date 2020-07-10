@@ -15,9 +15,9 @@ module WatchBuild
 
       ENV['FASTLANE_ITC_TEAM_ID'] = WatchBuild.config[:itc_team_id] if WatchBuild.config[:itc_team_id]
       ENV['FASTLANE_ITC_TEAM_NAME'] = WatchBuild.config[:itc_team_name] if WatchBuild.config[:itc_team_name]
-      ENV['SLACK_URL'] = WatchBuild.config[:slack_url]
 
-      Spaceship::ConnectAPI.login(WatchBuild.config[:username], nil, use_portal: false, use_tunes: true)
+      Spaceship::Tunes.login(WatchBuild.config[:username], nil)
+      Spaceship::Tunes.select_team
       UI.message('Successfully logged in')
 
       start = Time.now
@@ -29,31 +29,22 @@ module WatchBuild
     def wait_for_build(start_time)
       UI.user_error!("Could not find app with app identifier #{WatchBuild.config[:app_identifier]}") unless app
 
-      build = nil
-      showed_info = false
-
       loop do
         begin
-          build = find_build(build)
+          build = find_build
+          return build if build.processing == false
 
-          if build.nil?
-            UI.important("Read more information on why this build isn't showing up yet - https://github.com/fastlane/fastlane/issues/14997") unless showed_info
-            showed_info = true
+          seconds_elapsed = (Time.now - start_time).to_i.abs
+          case seconds_elapsed
+          when 0..59
+            time_elapsed = Time.at(seconds_elapsed).utc.strftime '%S seconds'
+          when 60..3599
+            time_elapsed = Time.at(seconds_elapsed).utc.strftime '%M:%S minutes'
           else
-            return build if build.processed?
-
-            seconds_elapsed = (Time.now - start_time).to_i.abs
-            case seconds_elapsed
-            when 0..59
-              time_elapsed = Time.at(seconds_elapsed).utc.strftime '%S seconds'
-            when 60..3599
-              time_elapsed = Time.at(seconds_elapsed).utc.strftime '%M:%S minutes'
-            else
-              time_elapsed = Time.at(seconds_elapsed).utc.strftime '%H:%M:%S hours'
-            end
-
-            UI.message("Waiting #{time_elapsed} for App Store Connect to process the build #{build.app_version} (#{build.version})... this might take a while...")
+            time_elapsed = Time.at(seconds_elapsed).utc.strftime '%H:%M:%S hours'
           end
+
+          UI.message("Waiting #{time_elapsed} for App Store Connect to process the build #{build.train_version} (#{build.build_version})... this might take a while...")
         rescue => ex
           UI.error(ex)
           UI.message('Something failed... trying again to recover')
@@ -68,21 +59,18 @@ module WatchBuild
     end
 
     def notification(build, minutes)
+      #require 'terminal-notifier'
+
       if build.nil?
         UI.message 'Application build is still processing'
         return
       end
 
-      platform = build.pre_release_version.platform.downcase.gsub('_', '')
-
-      url = "https://appstoreconnect.apple.com/apps/#{app.id}/testflight/#{platform}/#{build.id}/metadata"
-
-      slack_url = ENV['SLACK_URL'].to_s
-      if !slack_url.empty?
-        notify_slack(build, minutes, slack_url)
-      else
-        notify_terminal(build, minutes, url)
-      end
+      url = "https://appstoreconnect.apple.com/WebObjects/iTunesConnect.woa/ra/ng/app/#{@app.apple_id}/activity/ios/builds/#{build.train_version}/#{build.build_version}/details"
+      #TerminalNotifier.notify('Build finished processing',
+      #                        title: build.app_name,
+      #                        subtitle: "#{build.train_version} (#{build.build_version})",
+      #                        execute: "open '#{url}'")
 
       UI.success('Successfully finished processing the build')
       if minutes > 0 # it's 0 minutes if there was no new build uploaded
@@ -95,57 +83,17 @@ module WatchBuild
     private
 
     def app
-      @app ||= Spaceship::ConnectAPI::App.find(WatchBuild.config[:app_identifier])
+      @app ||= Spaceship::Application.find(WatchBuild.config[:app_identifier])
     end
 
-    def notify_slack(build, minutes, url)
-      require 'net/http'
-      require 'uri'
-      require 'json'
-
-      message = "App Store build #{build.app_version} (#{build.version}) has finished processing in #{minutes} minutes"
-      slack_url = URI.parse(url)
-      slack_message = {
-        "text": message
-      }
-
-      header = {'Content-Type': 'application/json'}
-  
-      http = Net::HTTP.new(slack_url.host, slack_url.port)
-      http.use_ssl = true
-      request = Net::HTTP::Post.new(slack_url.request_uri, header)
-      request.body = slack_message.to_json
-      response = http.request(request)
-
-      if response.kind_of?(Net::HTTPSuccess)
-        UI.success('Message sent to Slack.')
-      else
-        UI.user_error!('Error sending Slack notification.')
-      end
-    end
-
-    def notify_terminal(build, minutes, url)
-    	require 'terminal-notifier'
-
-    	TerminalNotifier.notify('Build finished processing',
-                              title: app.name,
-                              subtitle: "#{build.app_version} (#{build.version})",
-                              execute: "open '#{url}'")
-    end
-
-    # Finds a build if none given
-    # Otherwise fetches a build (to get updated state)
-    def find_build(build)
-      if build.nil?
-        build = app.get_builds(includes: Spaceship::ConnectAPI::Build::ESSENTIAL_INCLUDES).select do |build|
-          build.processing_state == Spaceship::ConnectAPI::Build::ProcessingState::PROCESSING
-        end.sort_by(&:uploaded_date).last
-      else
-        build = Spaceship::ConnectAPI::Build.get(build_id: build.id, includes: Spaceship::ConnectAPI::Build::ESSENTIAL_INCLUDES)
+    def find_build
+      build = nil
+      app.latest_version.candidate_builds.each do |b|
+        build = b if !build || b.upload_date > build.upload_date
       end
 
       unless build
-        UI.error("No processing builds available for app #{WatchBuild.config[:app_identifier]} - this may take a few minutes (check your email for processing issues if this continues)")
+        UI.user_error!("No processing builds available for app #{WatchBuild.config[:app_identifier]}")
       end
 
       build
